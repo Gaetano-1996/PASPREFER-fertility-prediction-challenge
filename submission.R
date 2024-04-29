@@ -15,30 +15,62 @@
 
 # List your packages here. Don't forget to update packages.R!
 library(dplyr) # as an example, not used here
+library(data.table)
 
-clean_df <- function(df, background_df = NULL){
+clean_df = function(df, background_df = NULL) {
   # Preprocess the input dataframe to feed the model.
-  ### If no cleaning is done (e.g. if all the cleaning is done in a pipeline) leave only the "return df" command
-
-  # Parameters:
-  # df (dataframe): The input dataframe containing the raw data (e.g., from PreFer_train_data.csv or PreFer_fake_data.csv).
-  # background (dataframe): Optional input dataframe containing background data (e.g., from PreFer_train_background_data.csv or PreFer_fake_background_data.csv).
-
-  # Returns:
-  # data frame: The cleaned dataframe with only the necessary columns and processed variables.
-
-  ## This script contains a bare minimum working example
-  # Create new age variable
-  df$age <- 2024 - df$birthyear_bg
-
-  # Selecting variables for modelling
-
-  keepcols = c('nomem_encr', # ID variable required for predictions,
-               'age')        # newly created variable
+  ### If no cleaning is done (e.g. if all the cleaning is done in a pipeline)
+  # leave only the "return df" command
   
-  ## Keeping data with variables selected
-  df <- df[ , keepcols ]
-
+  # Parameters:
+  # df (dataframe): The input dataframe containing the raw data
+  #(e.g., from PreFer_train_data.csv or PreFer_fake_data.csv).
+  # background (dataframe): Optional input dataframe containing background data
+  #(e.g., from PreFer_train_background_data.csv or
+  #PreFer_fake_background_data.csv).
+  
+  # Returns:
+  # data frame: The cleaned dataframe with only the necessary columns
+  # and processed variables.
+  
+  df = setDT(df)
+  
+  # extracting subset of predictors
+  keepcols = c("nomem_encr",
+               'age',
+               'gender',
+               'intention')
+  
+  # Gender
+  # imputation from background info
+  imp.gender = ifelse(is.na(df$cf20m003),df$gender_bg,df$cf20m003)
+  # refactoring
+  df = df[, gender := factor(
+    imp.gender,
+    levels = c(1, 2),
+    labels = c('male', 'female'),
+    exclude = NULL
+  )]
+  
+  # Age
+  df$cf20m004 <- as.numeric(df$cf20m004)
+  # imputation from bg info
+  imp.age = ifelse(is.na(df$cf20m004),df$age_bg,df$cf20m004)
+  breaks = c(-Inf, 24, 30, 34, 40, Inf)
+  lab = c("<=24", "25-30", "31-34", "35-40", ">40")
+  df[, age := cut(imp.age, breaks = breaks, labels = lab, right = TRUE)]
+  
+  # fertility intention
+  df = df[, intention := factor(
+    df[, cf20m128],
+    levels = c(1, 2, 3, NA),
+    labels = c('yes', 'no', 'notknown', 'missing'),
+    exclude = NULL
+  )]
+  
+  # data.table projection
+  df = df[, .SD, .SDcols = keepcols]
+  
   return(df)
 }
 
