@@ -14,8 +14,11 @@
 # run.R can be used to test your submission.
 
 # List your packages here. Don't forget to update packages.R!
-library(dplyr) # as an example, not used here
+library(tidyverse)
 library(data.table)
+library(bundle)
+library(butcher)
+library(tidymodels)
 
 clean_df = function(df, background_df = NULL) {
   # Preprocess the input dataframe to feed the model.
@@ -34,39 +37,121 @@ clean_df = function(df, background_df = NULL) {
   # and processed variables.
   
   df = setDT(df)
+  # selecting only obs. for which the outcome is available 
+  df[outcome_available == 1,]
   
   # extracting subset of predictors
   keepcols = c("nomem_encr",
                'age',
                'gender',
-               'intention')
+               'intention',
+               'intention2',
+               'intention3',
+               'health',
+               'limited',
+               'depress',
+               'implife'
+  )
   
   # Gender
-  # imputation from background info
+  # imputation of gender from background info
   imp.gender = ifelse(is.na(df$cf20m003),df$gender_bg,df$cf20m003)
-  # refactoring
-  df = df[, gender := factor(
+  # refactoring of gender variable
+  # converting gender into factor
+  df[, gender := factor(
     imp.gender,
     levels = c(1, 2),
     labels = c('male', 'female'),
-    exclude = NULL
-  )]
+    exclude = NULL)]
   
   # Age
-  df$cf20m004 <- as.numeric(df$cf20m004)
-  # imputation from bg info
-  imp.age = ifelse(is.na(df$cf20m004),df$age_bg,df$cf20m004)
+  # ensuring numeric type
+  df$birthyear_bg = as.numeric(df$birthyear_bg)
+  age_birth = 2020 - df$birthyear_bg
+  
+  # creating classes
   breaks = c(-Inf, 24, 30, 34, 40, Inf)
   lab = c("<=24", "25-30", "31-34", "35-40", ">40")
-  df[, age := cut(imp.age, breaks = breaks, labels = lab, right = TRUE)]
+  df[, age := cut(age_birth, breaks = breaks, labels = lab, right = TRUE)]
   
-  # fertility intention
-  df = df[, intention := factor(
-    df[, cf20m128],
-    levels = c(1, 2, 3, NA),
-    labels = c('yes', 'no', 'notknown', 'missing'),
-    exclude = NULL
-  )]
+  # Fertility Intention (cf20m128, cf20m129, cf20m130)
+  df = df %>% 
+    mutate(intention = factor(cf20m128,
+                              levels = c(1, 2, 3, NA),
+                              labels = c('yes', 'no', 'notknown', 'missing'),
+                              exclude = NULL),
+           intention2 = cut(cf20m129,
+                            breaks = c(-Inf, 0, 1, 2, Inf),
+                            labels = c("0", "1", "2", ">2"),
+                            right = T),
+           intention3 = cut(cf20m130,
+                            breaks =  c(-Inf, 1, 3, 6, Inf),
+                            labels = c("0-1", "2-3", "4-6", ">6"),
+                            right = TRUE))
+  
+  # Dealing with NAs (intention2)
+  df[intention == "no", intention2 := "0"]
+  df[is.na(intention2), intention2 := "missing"]
+  
+  # Dealing with NAs (intention3)
+  df[intention == "no", intention3 := "no"]
+  df[is.na(intention3), intention3 := "missing"]
+  
+  # Health
+  
+  # ch20m004  How would you describe your health, generally speaking?
+  df$ch20m004 <- as.numeric(df$ch20m004)
+  breaks = c(-Inf, 3, Inf)
+  lab = c("low", "high")
+  df[, health := cut(ch20m004, breaks = breaks, labels = lab, right = TRUE)]
+  df[is.na(health), health := "missing"]
+  
+  # ch20m020	To what extent did your physical health or emotional problems 
+  #           hinder your daily activities over the past month?
+  
+  df$ch20m020 <- as.numeric(df$ch20m020)
+  breaks = c(-Inf, 1, 2, Inf)
+  lab = c("no", "hardly", ">= a bit") #limited?
+  df[, limited := cut(ch20m020, breaks = breaks, labels = lab, right = TRUE)]
+  df[is.na(limited), limited := "missing"]
+  
+  # Depression
+  # ch20m011	I felt very anxious
+  # ch20m012	I felt so down that nothing could cheer me up
+  # ch20m013	I felt calm and peaceful
+  # ch20m014	I felt depressed and gloomy
+  # ch20m015	I felt happy
+  
+  # Define a vector of new levels in reverse order (for the two "positive items")
+  new_levels <- c(6, 5, 4, 3, 2, 1)
+  
+  # Convert the two positive items to a factor with the new levels
+  df[, ch20m013 := factor(ch20m013, levels = new_levels)]
+  df[, ch20m015 := factor(ch20m015, levels = new_levels)]
+  
+  df$ch20m011 <- as.numeric(df$ch20m011)
+  df$ch20m012 <- as.numeric(df$ch20m012)
+  df$ch20m013 <- as.numeric(df$ch20m013)
+  df$ch20m014 <- as.numeric(df$ch20m014)
+  df$ch20m015 <- as.numeric(df$ch20m015)
+  
+  # Now, sum all the scores
+  df[, sum_depr := rowSums(.SD, na.rm = TRUE), 
+     .SDcols = c("ch20m011", "ch20m012", "ch20m013", "ch20m014", "ch20m015")]
+  
+  df$sum_depr <- as.numeric(df$sum_depr)
+  breaks = c(-Inf, 0, 10, 14, Inf)
+  lab = c("missing", "low", "med", "high") #level of depression
+  df[, depress := cut(sum_depr, breaks = breaks, labels = lab, right = TRUE)]
+  
+  # Personality
+  # cp20l017	So far I have gotten the important things I want in life
+  df$cp20l017 <- as.numeric(df$cp20l017)
+  breaks = c(-Inf, 4, 6, Inf)
+  lab = c("low", "med", "high") #level of satisfaction with achievements in life
+  df[, implife := cut(cp20l017, breaks = breaks, labels = lab, right = TRUE)]
+  df[is.na(implife), implife := "missing"]
+  
   
   # data.table projection
   df = df[, .SD, .SDcols = keepcols]
@@ -95,32 +180,33 @@ predict_outcomes <- function(df, background_df = NULL, model_path = "./model.rds
   # dataframe: A dataframe containing the identifiers and their corresponding predictions.
   
   ## This script contains a bare minimum working example
-  if( !("nomem_encr" %in% colnames(df)) ) {
+  if (!("nomem_encr" %in% colnames(df))) {
     warning("The identifier variable 'nomem_encr' should be in the dataset")
   }
-
+  
   # Load the model
   model <- readRDS(model_path)
-    
+  
+  # Unbundle the model 
+  model = unbundle(model)
+  
   # Preprocess the fake / holdout data
   df <- clean_df(df, background_df)
-
-  # Exclude the variable nomem_encr if this variable is NOT in your model
-  vars_without_id <- colnames(df)[colnames(df) != "nomem_encr"]
   
   # Generate predictions from model
-  predictions <- predict(model, 
-                         subset(df, select = vars_without_id), 
-                         type = "response") 
+  predictions <- predict(model,
+                         df,
+                         type = "prob")
   
   # Create predictions that should be 0s and 1s rather than, e.g., probabilities
-  predictions <- ifelse(predictions > 0.5, 1, 0)  
+  predictions <- ifelse(predictions$.pred_1 > 0.5, 1, 0)
   
   # Output file should be data.frame with two columns, nomem_encr and predictions
-  df_predict <- data.frame("nomem_encr" = df[ , "nomem_encr" ], "prediction" = predictions)
+  df_predict <- data.frame("nomem_encr" = df[, "nomem_encr"],
+                           "prediction" = predictions)
   # Force columnnames (overrides names that may be given by `predict`)
-  names(df_predict) <- c("nomem_encr", "prediction") 
+  names(df_predict) <- c("nomem_encr", "prediction")
   
   # Return only dataset with predictions and identifier
-  return( df_predict )
+  return(df_predict)
 }
