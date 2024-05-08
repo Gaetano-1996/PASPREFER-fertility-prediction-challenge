@@ -6,6 +6,7 @@ install.packages(c("tidyverse",
                    "dials",
                    "butcher",
                    "bundle",
-                   "doParallel"),
+                   "doParallel",
+                   "ranger"),
                  repos = "https://cran.r-project.org",
                  dependencies = TRUE)
