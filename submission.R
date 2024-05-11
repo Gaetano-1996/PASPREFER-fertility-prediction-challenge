@@ -20,25 +20,24 @@ library(bundle)
 library(butcher)
 library(tidymodels)
 
-clean_df = function(df, background_df = NULL) {
+clean_df = function(df, # train data
+                    background_df = NULL){ # background data (if needed)
   # Preprocess the input dataframe to feed the model.
-  ### If no cleaning is done (e.g. if all the cleaning is done in a pipeline)
-  # leave only the "return df" command
   
-  # Parameters:
-  # df (dataframe): The input dataframe containing the raw data
+  # @ARGS:
+  # df -> [data.frame]: The input dataframe containing the raw data
   #(e.g., from PreFer_train_data.csv or PreFer_fake_data.csv).
-  # background (dataframe): Optional input dataframe containing background data
-  #(e.g., from PreFer_train_background_data.csv or
+  # background -> [data.frame]: Optional input dataframe containing background 
+  #data (e.g., from PreFer_train_background_data.csv or
   #PreFer_fake_background_data.csv).
   
-  # Returns:
-  # data frame: The cleaned dataframe with only the necessary columns
-  # and processed variables.
+  # @RETURNS:
+  # df -> [data.frame]: The cleaned dataframe with only the necessary columns
+  #and processed variables.
   
   df = setDT(df)
   # selecting only obs. for which the outcome is available 
-  df[outcome_available == 1,]
+  df = df[outcome_available == 1,]
   
   # extracting subset of predictors
   keepcols = c("nomem_encr",
@@ -47,57 +46,194 @@ clean_df = function(df, background_df = NULL) {
                'intention',
                'intention2',
                'intention3',
+               #'past_intention',
                'health',
                'limited',
                'depress',
-               'implife'
+               'implife',
+               'education',
+               'partner',
+               'n_children',
+               'occupation',
+               'income',
+               'migration'
   )
   
-  # Gender
-  # imputation of gender from background info
+  # GENDER 
+  # Imputation of gender from background info
   imp.gender = ifelse(is.na(df$cf20m003),df$gender_bg,df$cf20m003)
-  # refactoring of gender variable
-  # converting gender into factor
+  
+  # Converting gender into factor
   df[, gender := factor(
     imp.gender,
     levels = c(1, 2),
     labels = c('male', 'female'),
     exclude = NULL)]
   
-  # Age
-  # ensuring numeric type
+  # AGE 
+  # Ensuring numeric type
   df$birthyear_bg = as.numeric(df$birthyear_bg)
+  # Creating the age from the birth year
   age_birth = 2020 - df$birthyear_bg
   
-  # creating classes
+  # Creating classes
   breaks = c(-Inf, 24, 30, 34, 40, Inf)
   lab = c("<=24", "25-30", "31-34", "35-40", ">40")
   df[, age := cut(age_birth, breaks = breaks, labels = lab, right = TRUE)]
   
-  # Fertility Intention (cf20m128, cf20m129, cf20m130)
-  df = df %>% 
-    mutate(intention = factor(cf20m128,
-                              levels = c(1, 2, 3, NA),
-                              labels = c('yes', 'no', 'notknown', 'missing'),
-                              exclude = NULL),
-           intention2 = cut(cf20m129,
-                            breaks = c(-Inf, 0, 1, 2, Inf),
-                            labels = c("0", "1", "2", ">2"),
-                            right = T),
-           intention3 = cut(cf20m130,
-                            breaks =  c(-Inf, 1, 3, 6, Inf),
-                            labels = c("0-1", "2-3", "4-6", ">6"),
-                            right = TRUE))
+  # FERTILITY INTENTION 
+  # cf20m128: Do you think you will have [more] children in the future?
+  df[, intention := factor(
+    cf20m128,
+    levels = c(1, 2, 3, NA),
+    labels = c('yes', 'no', 'notknown', 'missing'),
+    exclude = NULL
+  )]
   
-  # Dealing with NAs (intention2)
+  # cf20m129: How many [more] children do you think you will have in the future?
+  df[, intention2 := cut(
+    cf20m129,
+    breaks = c(-Inf, 0, # 0
+               1, #1
+               2, #2
+               Inf),#>2
+    labels = c("0", "1", "2", ">2"),
+    right = T
+  )]
+  
+  # Dealing with NAs
   df[intention == "no", intention2 := "0"]
   df[is.na(intention2), intention2 := "missing"]
   
-  # Dealing with NAs (intention3)
+  # cf20m130: Within how many years do you hope to have your [next/first] child?
+  # handling weird value, such as 2025
+  df[cf20m130>2020, cf20m130 := cf20m130-2020]
+  
+  df[, intention3 := cut(
+    cf20m130,
+    breaks =  c(-Inf,1, # 0-1
+                3, # 2-3
+                6, # 4-6
+                Inf),# >6
+    labels = c("0-1", "2-3", "4-6", ">6"),
+    right = T
+  )]
+  
+  # Dealing with NAs
   df[intention == "no", intention3 := "no"]
   df[is.na(intention3), intention3 := "missing"]
   
-  # Health
+  
+  # EDUCATION
+  # oplcat_2020
+  # Coerce to numeric
+  df$oplcat_2020 <- as.numeric(df$oplcat_2020)
+  # Converting to ordinal
+  df[, education := cut(
+    oplcat_2020,
+    breaks = c(-Inf, 2, #lower = up to int sec
+               3, # high sec.
+               4, 
+               5,
+               6, Inf),
+    labels = c('lower', 'high sec.', 
+               'int. vocational','high vocational',
+               'university','missing'),
+    right = T)]
+  df[is.na(education), education := 'missing']
+  
+  # NUMBER OF CHILDREN (COMPOSED) 
+  # cf20-19-18-17*454 + cf20-19-18-17*455
+  df$n_children = ifelse(df$cf20m454==2,0,df$cf20m455)
+  
+  df$n_children = ifelse(is.na(df$n_children),
+                         ifelse(df$cf19l454==2,NA,df$cf19l455),
+                         df$n_children)
+  
+  df$n_children = ifelse(is.na(df$n_children),
+                         ifelse(df$cf18k454==2,NA,df$cf18k455),
+                         df$n_children)
+  
+  df$n_children <- ifelse(is.na(df$n_children), 
+                          ifelse(df$cf17j454==2,NA, df$cf17j455),
+                          df$n_children)
+  
+  # Converting it to a factor
+  df[,n_children := cut(
+    n_children,
+    breaks = c(-Inf,0, #0
+               1, #1
+               2, #2
+               Inf), #>2
+    labels = c("0", "1", "2", ">2"),
+    right=T
+  )]
+  
+  # Dealing with NAs
+  df[is.na(n_children), n_children := "missing"]
+  
+  # PARTNERSHIP (composed) 
+  # cf20m024 + burgstat_2020
+  df$partner <- as.numeric(df$cf20m024==1) # have a partner in 2020
+  df$burgstat_2020 <- as.numeric(df$burgstat_2020==1) # married in 2020
+  # imputing partnership from civil status (2020)
+  df$partner <- ifelse(is.na(df$partner),
+                       df$burgstat_2020==1,
+                       df$partner)
+  # coercing to factor
+  df[,partner := as.factor(partner)]
+  # Dealing with NAs
+  df[is.na(partner), partner := "missing"]
+  
+  # OCCUPATION  
+  # belbezig_2020
+  
+  df <- df %>%
+    mutate(occupation = case_when(
+      belbezig_2020 %in% c(1, 2) ~ "work",
+      belbezig_2020 %in% c(3:5, 8:13) ~ "not_work" ,
+      belbezig_2020 %in% c(7) ~ "in_school",
+      TRUE ~ "missing"
+    ))
+  df[, occupation := factor(occupation)]
+  # INCOME 
+  # nettoink_f_20**
+  # Imputation from 2019
+  df$nettoink_f_2020 = ifelse(is.na(df$nettoink_f_2020),
+                              df$nettoink_f_2019,
+                              df$nettoink_f_2020)
+  
+  # Imputation from 2018
+  df$nettoink_f_2020 <- ifelse(is.na(df$nettoink_f_2020),
+                               df$nettoink_f_2018,
+                               df$nettoink_f_2020)
+  
+  df$nettoink_f_2020 <- as.numeric(df$nettoink_f_2020)
+  breaks = c(-Inf, 900, 1900, 2400, Inf)
+  lab = c("q1", "q2", "q3",  "q4")
+  df[, income := cut(nettoink_f_2020, 
+                     breaks = breaks, 
+                     labels = lab, 
+                     right = TRUE)]
+  
+  # Dealing with NAs
+  df[is.na(nettoink_f_2020), income := "missing"]
+  
+  # MIGRATION BG 
+  table(df$migration_background_bg, useNA = "always")
+  
+  df <- df %>%
+    mutate(migration = case_when(
+      migration_background_bg == 0 ~ "Dutch",
+      migration_background_bg == 101 ~ "West_1st" ,
+      migration_background_bg == 102 ~ "Not_west_1st",
+      migration_background_bg == 201 ~ "West_2nd",
+      migration_background_bg == 202 ~ "Not_west_2nd",
+      TRUE ~ "missing"
+    ))
+  
+  df[,migration := factor(migration)]
+  # HEALTH 
   
   # ch20m004  How would you describe your health, generally speaking?
   df$ch20m004 <- as.numeric(df$ch20m004)
@@ -115,7 +251,7 @@ clean_df = function(df, background_df = NULL) {
   df[, limited := cut(ch20m020, breaks = breaks, labels = lab, right = TRUE)]
   df[is.na(limited), limited := "missing"]
   
-  # Depression
+  # DEPRESSION (COMPOSED) 
   # ch20m011	I felt very anxious
   # ch20m012	I felt so down that nothing could cheer me up
   # ch20m013	I felt calm and peaceful
@@ -144,7 +280,7 @@ clean_df = function(df, background_df = NULL) {
   lab = c("missing", "low", "med", "high") #level of depression
   df[, depress := cut(sum_depr, breaks = breaks, labels = lab, right = TRUE)]
   
-  # Personality
+  # PERSONALITY 
   # cp20l017	So far I have gotten the important things I want in life
   df$cp20l017 <- as.numeric(df$cp20l017)
   breaks = c(-Inf, 4, 6, Inf)
@@ -154,12 +290,14 @@ clean_df = function(df, background_df = NULL) {
   
   
   # data.table projection
-  df = df[, .SD, .SDcols = keepcols]
+  df =df[, .SD, .SDcols = keepcols]
   
   return(df)
 }
 
-predict_outcomes <- function(df, background_df = NULL, model_path = "./model.rds"){
+predict_outcomes <- function(df, 
+                             background_df = NULL, 
+                             model_path = "./model.rds"){
   # Generate predictions using the saved model and the input dataframe.
     
   # The predict_outcomes function accepts a dataframe as an argument
@@ -199,7 +337,8 @@ predict_outcomes <- function(df, background_df = NULL, model_path = "./model.rds
                          type = "prob")
   
   # Create predictions that should be 0s and 1s rather than, e.g., probabilities
-  predictions <- ifelse(predictions$.pred_1 > 0.5, 1, 0)
+  predictions <- ifelse(predictions$.pred_1 > 0.4, # lowering probs
+                        1, 0)
   
   # Output file should be data.frame with two columns, nomem_encr and predictions
   df_predict <- data.frame("nomem_encr" = df[, "nomem_encr"],
