@@ -1,0 +1,1756 @@
+---
+title: "Data-driven Variable Selection" 
+output: html_document
+author: Gaetano Tedesco
+editor_options:  
+  chunk_output_type: inline
+  markdown: 
+    wrap: sentence
+---
+
+In this notebook we explore the possibility of selecting useful and informative predictors in a data-driven way using a lasso regression.
+
+# Importing libraries and data
+
+```{r}
+# Libraries
+library(data.table)
+library(tidyverse)
+library(glmnet)
+library(doParallel)
+library(mltools) # not used
+library(fastDummies)
+source("~/Desktop/Code/LOCAL-PreFer Data challenge/Submission Tester/utils.R")
+
+# Training data
+prefer = fread("~/Desktop/Code/LOCAL-PreFer Data challenge/Data/training_data/PreFer_train_data.csv")
+cat("Training-set dimensions\nRows:",dim(prefer)[1],"\nColumns:",dim(prefer)[2])
+
+# Outcome data
+outcome = fread("~/Desktop/Code/LOCAL-PreFer Data challenge/Data/training_data/PreFer_train_outcome.csv")
+
+# Background information
+background = fread("~/Desktop/Code/LOCAL-PreFer Data challenge/Data/other_data/PreFer_train_background_data.csv")
+cat("\nBackground data dimensions\nRows:",dim(background)[1],"\nColumns:",dim(background)[2])
+
+# codebook (as reference for some ops)
+codebook = fread("~/Desktop/Code/LOCAL-PreFer Data challenge/Data/codebooks/PreFer_codebook.csv")
+
+```
+
+# Filtering and Merging
+
+We will filter the dataset using the col `outcome_available`, therefore selecting the individuals for which we observed the outcome of interest in 2023.\
+For ease of manipulation, we will merge, for these observation, the wave20 and the background data available in a unique dataset.
+
+```{r}
+# Subsetting the training data to keep only the observation with the outcome
+prefer = prefer[outcome_available == 1,]
+
+# dealing with repeated values in the "nomem_encr" col, 
+# let's extract only the information from 2020/12
+background20 = background %>% 
+  filter(grepl("^202012", # selecting only LAST information available 
+               wave))
+
+# left join of the training-set with the background data 
+prefer_full = prefer %>% 
+  left_join(background20, by = "nomem_encr")
+
+# freing up memory
+rm(background, background20, prefer)
+```
+
+# First manual selection of vars. from 2020 + Background information
+
+Let's examine all the variable from the last wave (2020), which constitute the most recent information about the individuals.
+We select only answer to the 2020 questionnaires and some background information provided about the individuals.
+
+```{r}
+# pattern specification for wave 2020
+wave20 = "^c[a-zA-Z]20[a-zA-Z]\\d{3}$"
+
+# only survey responses no background (due to pattern specification)
+cols20 = grep(wave20, names(prefer_full), value = T)
+
+# N. of varaibles selected
+cat("N. of questions from wave 2020:",length(cols20))
+```
+
+We have 2257 variables/questions for the 2020's wave.
+
+How many missing data do we have here?
+
+```{r}
+# percentage of missing values for each variable
+na_count = sapply(prefer_full[,
+                              .SD,
+                              .SDcols = cols20],
+                  function(x) sum(is.na(x))/nrow(prefer_full)
+                  )
+
+# variables with less than 75% of missing values
+keep_vars_20 = names(na_count)[which(na_count<0.75)] # 1410 variables 
+cat("Variable selected with less than 75% of missing:",length(keep_vars_20),"\n")
+
+# variables with more than 75% of missing values
+drop_vars_20 = names(na_count)[which(na_count>=0.75)]
+cat("Variable dropped with more than 75% of missing:",length(drop_vars_20),"\n")
+```
+
+For 847 variables we have a lot of missing (more than 75%), we will not consider these variable in the automatic selection process since we should impute a lot of information and this is never a good idea.
+
+Now let's explore some background information about the respondents
+
+```{r}
+# selecting bg variable for year 2020
+bg_vars = codebook[(survey == "Background Variables"), # variable from background set
+                  var_name]
+
+# N. background varaibles
+cat("Background variables:",length(bg_vars))
+
+# checking missing and remove those with >75% missing
+na_count_bg = sapply(prefer_full[,
+                                 .SD,
+                                 .SDcols = bg_vars],
+                     function(x) sum(is.na(x))/nrow(prefer_full)
+                     )
+
+# list of varaible to be kept from background
+keep_vars_bg = names(na_count_bg)[which(na_count_bg<0.75)]
+cat("\nVariable selected with less than 75% of missing (bg):",length(keep_vars_bg))
+
+# Selection of summary information (from training data, no background)
+sum_vars = codebook[(survey == "Summary Background Variables" & year == 2020),
+                    var_name]
+
+# N. summary varaibles
+cat("\nSummary variables:",length(sum_vars))
+
+# checking missing and remove those with >75% missing
+na_count_sum = sapply(prefer_full[,
+                                 .SD,
+                                 .SDcols = sum_vars],
+                     function(x) sum(is.na(x))/nrow(prefer_full)
+                     )
+
+# list of varaible to be kept from summary
+keep_vars_sum = names(na_count_sum)[which(na_count_sum<0.75)]
+cat("\nVariable selected with less than 75% of missing (sum):",length(na_count_sum))
+
+# variables from 2020 + summary info
+keep_vars_20sum = c(keep_vars_20,keep_vars_sum)
+
+# variables from 2020 + background info
+keep_vars_20bg = c(keep_vars_20, keep_vars_bg)
+
+# we concatenate the name of the variable form wave 2020 with those form the background and summary infromation
+keep_vars_all = c(keep_vars_20, keep_vars_bg, keep_vars_sum)
+cat("\nN. of variables to keep (wave2020 + background + summary):",length(keep_vars_all))
+```
+
+On the other side all the background variables and all the summary' ones, have less than 75% of missing value.
+Therefore we consider all of them.
+
+After these first filtering of the variables we notice some complicated and not very useful kind of information, such as "date or time" or "response to open-ended question", that might interfere with our data-driven variable selection.
+Such variables could, in fact, result important given the high number of single values.
+Therefore, we decided to remove such variables before apply the variable selection techniques.
+
+In order to explore the importance of the predictor we will test different approach to the data-driven variable selection, all bases on a different set of information:\
+1.
+Variable from wave 2020 -\> how informative are the background variable?\
+2.
+Variable from summary and background -\> is there overlap between the two?\
+3.
+Variable from wave 2020 + background information.\
+4.
+Variable from wave 2020 + summary information\
+5.
+Variable from wave 2020 + background info.
++ summary info.
+
+```{r}
+# taking only 2020 responses (without background or summary information)
+prefer_20 = prefer_full[,.SD,
+                          .SDcols = keep_vars_20] %>% # selecting answers from 2020
+  clean_types(codebook) # removing date/time and response to open-ended questions
+
+cat("\nFinal n. of variable to analyse from the 'wave 2020 only' data:", dim(prefer_20)[2])
+
+# taking only summary and background information
+prefer_bgsum = prefer_full[, .SD,
+                           .SDcols = c(keep_vars_bg, keep_vars_sum)] %>% 
+  clean_types(codebook) # removing date/time and response to open-ended questions
+
+cat("\nFinal n. of variable to analyse from background and background summary data:", dim(prefer_bgsum)[2])
+
+# taking vars from 2020 + summary info.
+prefer_20sum = prefer_full[,.SD,
+                          .SDcols = keep_vars_20sum] %>% # selecting answers from 2020
+  clean_types(codebook) # removing date/time and response to open-ended questions
+
+cat("\nFinal n. of variable to analyse from the 'wave 2020' and background summary data:", dim(prefer_20sum)[2])
+
+# taking vars from 2020 + background info.
+prefer_20bg = prefer_full[,.SD,
+                          .SDcols = keep_vars_20bg] %>% # selecting answers from 2020
+  clean_types(codebook) # removing date/time and response to open-ended questions
+
+cat("\nFinal n. of variable to analyse from the 'wave 2020' and background data:", dim(prefer_20bg)[2])
+
+# taking all the available information
+prefer_all = prefer_full[,.SD, .SDcols = keep_vars_all] %>% # selecting answers from 2020 + background
+  clean_types(codebook) # removing date/time and response to open-ended questions
+
+cat("\nFinal n. of variable to analyse from the 'wave 2020', background and background summary data:", dim(prefer_all)[2])
+
+# free memory
+#rm(prefer_full)
+```
+
+# Variable Selection with `glmnet`
+
+### Why do we do this?
+
+In practice, we are interested in finding a subset of variables that are highly predictive of the outcome and removing all the other predictors that might bring redundant information (such as highly correlate variables between each other).
+
+The LASSO regression is a regularization technique that uses the LAR algorithm to solve a bounded optimization problem.
+We start with all coefficients set to 0, and identify the predictor (feature) most correlated with the response variable (target).
+The coefficient of this predictor is moved from zero towards its least squares value until another predictor becomes equally correlated with the current residuals.
+Once another predictor is equally correlated with the residuals, LAR includes this predictor in the active set and moves in a direction equiangular between all active predictors.
+This process continues, adding one predictor at a time and adjusting the coefficients along the way.
+Adding a penalty, the L1 norm, on the size of the coefficients forces some of them to shrink to zero, resulting in LASSO.
+This penalty discourages the inclusion of highly correlated predictors by assigning zero weights to less important variables, effectively removing them from the model.
+
+We want to find the value of $\lambda$ associated the best model (in term of classification error or AUC).
+For each value of $\lambda$ some coefficient is exactly 0 and it will not be considered by it.
+Optimizing $\lambda$ we also obtain the best subset of predictors that bring the maximum predictive power.
+
+## Defining the predictor matrix.
+
+In order to use the `glmnet` algorithm we need to handle the missing value in our dataframe.
+For *categorical* variables we encode the variable using *one-hot enconding*, therefore creating a level for the missing values, for numerical value we will impute the missing level with the mean of the variable.
+
+We will create two different *model matrices* for the two different sets of information that we have.
+
+```{r}
+# Only questions from 2020
+x20 = prefer_20 %>% make_X()
+
+# Wave 2020 + background infromation
+x20bg = prefer_20bg %>% make_X()
+
+# Wave 2020 + summary information
+x20sum = prefer_20sum %>%  make_X()
+
+# Background + summary
+xbgsum = prefer_bgsum %>% make_X()
+
+# All information
+xall = prefer_all %>%  make_X()
+```
+
+Corecign the outcome variable as factor for classification purpose:
+
+```{r}
+y = as.factor(outcome[!is.na(new_child), new_child])
+```
+
+# Only wave 2020
+
+We start considering the question from the wave 2020 alone and see which questions are more important when predicting fertility.
+
+### Classification error
+
+Now let's use cross-validation to select the best value of the shrinkage parameter $\lambda$, that the produce the minimum error (measured in **classification error**).
+
+```{r}
+set.seed(123) # setting seed for reproducibility of the results
+doParallel::registerDoParallel(cores = detectCores()) # setting parallel backend 
+cv_fit = cv.glmnet(x20,y,
+                   family="binomial",
+                   parallel = T, # using parallel backend
+                   type.measure = "class") # optimization fo the classification error
+```
+
+Let's visualize the optimization process and derive the value of $\lambda$ that brings to the minimum error
+
+```{r}
+plot(cv_fit) # error vs log(lambda) vs N. predictors
+```
+
+From the graph we see how values of $\log(\lambda)$ a bit smaller than -3 brings us to the best result in term of *classification error*, associated with such value we have a set of $p$ variables, with $p \approx 25$ (first dotted line).
+
+**Lasso profiles and Model exploration** We now explore the Lasso profiles to see how the coefficient are shrunk towards 0 as we increase the value of our parameter.
+We also care about the amount of null deviance explained by each predictor, and we might keep into consideration also the largest informative set found.
+
+```{r}
+# last fit on the entire data
+last_fit = glmnet(x20,y,
+                  family = "binomial")
+
+# extracting best lambda in term of error
+best_lambda = cv_fit$lambda.min
+
+# LASSO PROFILES
+plot(last_fit, xvar="lambda")
+title("Lasso Profiles", line = 2.5)
+abline(v = log(best_lambda), lwd = 2, lty = 2)
+
+# FRACTION DEVIANCE EXPLAINED
+plot(last_fit, xvar="dev")
+title(main = "Fraction of Deviance Explained", line = 2.5)
+
+# model exploration
+#print(last_fit)
+cat("\nBest lambda: ", best_lambda)
+```
+
+The result of the `print()` function show us form right to left the numerical results of the lasso procedure.\
+In particular we have: - `Df`: number of non-zero coefficients,\
+- `%Dev`: the percentage of null deviance explained by the associated model,\
+- `Lambda`: the value of $\lambda$ associated with the model.\
+
+Notably, the best value of lambda (0.038920) is the one associated with a $37.11\%$ of deviance explained while to get up to an 80% we need at least 272 variables and 358 to cover the $\approx 95\%$.
+This already give us some hint compared to the previous exploration `Variable_Selection1.Rmd` in which, considering all the question of the 2020 alone, we needed more than 500 variables in order to explain the $\approx 93\%$.
+
+This might be due to the new encoding of the model matrix, regarding which I have to theories: 1.The good one: the new encoding, with a column accounting for NAs, better express the information about the *not_at_random missing values* and therefore some of this NA's cols actually has some information that allows to discard some of the other levels cols for the same variable.
+2.The bad one: variance was higher in the previous encoding, there might have been more information in general to start with.
+
+Now we are interested in seeing the variables selected in the model with the lowest classification error.
+
+```{r}
+# extracting the significant predictors from the lasso fit, for the best lambda
+coef20 = coef(cv_fit,
+                s = best_lambda) %>%  as.matrix()
+```
+
+Which is the variable that has the most predictive power for our outcome?
+
+```{r}
+# max coefficient
+# extract the index corresponding to the highest abs value of the coefficients
+max_coeff_index = which.max(abs(coef20[-1])) + 1 
+
+# selecting the correspondent predictor name
+max_coeff_pred = rownames(coef20)[max_coeff_index]
+
+cat("The predictor that shows the greatest coefficient:", max_coeff_pred,
+    "\nwith a value of:",coef20[max_coeff_index])
+```
+In this case we have that having some fertility intention increase from a 15% the log-odds of having a baby.
+
+Let's select that variable with **not null coefficients**
+
+```{r}
+# not null predictors
+nnz_index = which(coef20 != 0)[-1]
+nnz_preds = rownames(coef20)[nnz_index]
+
+# we might want to strip the level name in order to get just the names of the variable
+#imp_vars = sapply(lasso_preds, substr, start=1,stop=8)
+
+imp_vars_20_class = unname(nnz_preds) %>% 
+  unique()
+
+cat("Best lambda:",best_lambda, "\nN. of variables selected: ",length(imp_vars_20_class))
+```
+As said before we have 25 predictors. 
+
+What is the numerical "effect" of such variables?
+```{r}
+# extracting the not null coefficients
+nnz_coeff = coef20[nnz_index]
+
+# Not null predictors and coefficients
+nnz_eff_20_class = data.frame(
+  Var = nnz_preds,
+  Coeff = round(nnz_coeff,4)) %>% arrange(Coeff)
+
+#print(nnz_eff_20_class)
+```
+
+Let's check what these variables are
+```{r}
+imp_vars_20_class
+```
+
+### AUC
+
+We now repeat the same procedure but this time we optimize the *AUC* metric.
+```{r}
+set.seed(123) # setting seed for reproducibility of the results
+doParallel::registerDoParallel(cores = detectCores()) # setting parallel backend 
+cv_fit = cv.glmnet(x20,y,
+                   family="binomial",
+                   parallel = T, # using parallel backend
+                   type.measure = "auc") # optimization AUC
+```
+
+Let's visualize the optimization process and derive the value of $\lambda$ that brings to the maximum AUC
+```{r}
+plot(cv_fit)
+```
+
+From the graph we see how values of $\log(\lambda)$ a bit bigger than -4, and that model select a slightly different set of variables (even if the information is the same).
+In particular, we have that the best model uses $p \approx 48$ varaibles.
+
+**Lasso profiles and Model exploration** We now explore the Lasso profiles to see how the coefficient are shrunk towards 0 as we increase the value of our regularization parameter.
+We also care about the amount of null deviance explained by each predictor.
+
+```{r}
+# last fit on the entire data
+last_fit = glmnet(x20,y,
+                  family = "binomial")
+
+# extracting best lambda in term of error
+best_lambda = cv_fit$lambda.min
+
+# LASSO PROFILES
+plot(last_fit, xvar="lambda")
+title("Lasso Profiles", line = 2.5)
+abline(v = log(best_lambda), lwd = 2, lty = 2)
+
+# FRACTION DEVIANCE EXPLAINED
+plot(last_fit, xvar="dev")
+title(main = "Fraction of Deviance Explained", line = 2.5)
+
+# model exploration
+#print(last_fit)
+cat("\nBest lambda: ", best_lambda)
+```
+
+When optimizing the *AUC* value the best value of lambda is the one associated with a $44.72\%$ of deviance explained, so a bit more than when considering the classification error. In this case, we select 56 variables as the best set of predictors (double the number of variables of the classification error optimized model).
+Furthermore it's important to notice that, even if the set of predictors considered with the best lambda is larger, the model required the same number of varaibles (358) and explain the same deviance (94.96) with the smallest lambda considered. 
+
+
+Now we select the variables selected in the model with the highest AUC.
+```{r}
+# extracting the significant predictors from the lasso fit, for the best lambda
+coef20 = coef(cv_fit,
+                s = best_lambda) %>%  as.matrix()
+```
+
+Which is the variable that has the most predictive power for our outcome?
+
+```{r}
+# max coefficient
+# extract the index corresponding to the highest abs value of the coefficients
+max_coeff_index = which.max(abs(coef20[-1])) + 1 
+
+# selecting the correspondent predictor name
+max_coeff_pred = rownames(coef20)[max_coeff_index]
+
+cat("The predictor that shows the greatest coefficient:", max_coeff_pred,
+    "\nwith a value of:",coef20[max_coeff_index])
+```
+Again, we have that the fertility intention answer is the most effective in predicting the outcome, in particular the "yes" level of the factor.
+
+Let's select that variable with not null coefficients
+```{r}
+# not null predictors
+nnz_index = which(coef20 != 0)[-1]
+nnz_preds = rownames(coef20)[nnz_index]
+
+imp_vars_20_auc = unname(nnz_preds) %>% 
+  unique()
+
+cat("Best lambda:",best_lambda, "N. of variables selected: ",length(imp_vars_20_auc))
+```
+
+What is the numerical "effect" of such variables?
+```{r}
+# extracting the not null coefficients
+nnz_coeff = coef20[nnz_index]
+
+# Not null predictors and coefficients
+nnz_eff_20_auc = data.frame(
+  Var = nnz_preds,
+  Coeff = round(nnz_coeff,4)) %>% arrange(Coeff)
+
+#print(nnz_eff_20_auc)
+```
+As before first and last predictors are the level of the fertility intention question `cf20m128`. In particular, we see some asymmetric effect of the "yes" and "no" answer, with the answer "no" accounting for a decrease in the log-odds of having a baby in 2023 of $9\%$, compared with the $30\%$ increase found for the "yes" answer.
+
+Let's check what these variables are
+```{r}
+imp_vars_20_auc
+```
+
+# Background information and Summary variable (how much information is there and there, where?)
+
+### Classification error
+
+```{r}
+set.seed(123) # setting seed for reproducibility of the results
+doParallel::registerDoParallel(cores = detectCores()) # setting parallel backend 
+cv_fit = cv.glmnet(xbgsum,y,
+                   family="binomial",
+                   parallel = T, # using parallel backend
+                   type.measure = "class") # optimization fo the classification error
+```
+
+Let's visualize the optimization process and derive the value of $\lambda$ that brings to the minimum error
+```{r}
+plot(cv_fit) # error vs log(lambda) vs N. predictors
+```
+
+From the graph we see how values of $\log(\lambda)$ very close to -4 brings us to the best result in term of *classification error*, associated with such value we have a set of $p$ variables, larger than 25.
+
+**Lasso profiles and Model exploration** We now explore the Lasso profiles to see how the coefficient are shrunk towards 0 as we increase the value of our regularization parameter.
+We also care about the amount of null deviance explained by each predictor, and we might keep into consideration also the largest informative set found.
+```{r}
+# last fit on the entire data
+last_fit = glmnet(xbgsum,y,
+                  family = "binomial")
+
+# extracting best lambda in term of error
+best_lambda = cv_fit$lambda.min
+
+# LASSO PROFILES
+plot(last_fit, xvar="lambda")
+title("Lasso Profiles", line = 2.5)
+abline(v = log(best_lambda), lwd = 2, lty = 2)
+
+# FRACTION DEVIANCE EXPLAINED
+plot(last_fit, xvar="dev")
+title(main = "Fraction of Deviance Explained", line = 2.5)
+
+# model exploration
+#print(last_fit)
+cat("\nBest lambda: ", best_lambda)
+```
+From the output of our lasso regression we see how few information is contained in the background + summary set. We need 159 variables out of 223 to explain only the $36.21\%$ of the deviance. There's more than the financial and socio-demographic situation to predict if someone is gong or not to have a child!
+
+When optimizing the *AUC* value the best value of lambda is the one associated with a $24.57\%$ of deviance explained. When compared with amount of deviance explain by the "complete" set of 159 vars. we see that less then half variable are sufficient for explaining more than hal the total amount of deviance that these information set can explain. I believe that is because we have a lot of redudant information.
+ 
+
+Now we select the variables selected in the model with the highest AUC.
+```{r}
+# extracting the significant predictors from the lasso fit, for the best lambda
+coefbgsum = coef(cv_fit,
+                s = best_lambda) %>%  as.matrix()
+```
+
+Which is the variable that has the most predictive power for our outcome?
+```{r}
+# max coefficient
+# extract the index corresponding to the highest abs value of the coefficients
+max_coeff_index = which.max(abs(coefbgsum[-1])) + 1 
+
+# selecting the correspondent predictor name
+max_coeff_pred = rownames(coefbgsum)[max_coeff_index]
+
+cat("The predictor that shows the greatest coefficient:", max_coeff_pred,
+    "\nwith a value of:",coefbgsum[max_coeff_index])
+```
+In this case the most predictive variable is the question: "Household member participates in the panel" and, in particular, the "no" answer to such question. 
+
+Let's select that variable with not null coefficients
+
+```{r}
+# not null predictors
+nnz_index = which(coefbgsum != 0)[-1]
+nnz_preds = rownames(coefbgsum)[nnz_index]
+
+imp_vars_bgsum_class = unname(nnz_preds) %>% 
+  unique()
+
+cat("Best lambda:",best_lambda, "N. of variables selected: ",length(imp_vars_bgsum_class))
+```
+
+What is the numerical "effect" of such variables?
+```{r}
+# extracting the not null coefficients
+nnz_coeff = coefbgsum[nnz_index]
+
+# Not null predictors and coefficients
+nnz_eff_bgsum_class = data.frame(
+  Var = nnz_preds,
+  Coeff = round(nnz_coeff,4)) %>% arrange(Coeff)
+
+#print(nnz_eff_bgsum_class)
+```
+
+Let's check what these variables are
+```{r}
+imp_vars_bgsum_class
+```
+
+### AUC
+
+We now repeat the same procedure but this time we optimize the *AUC* metric.
+```{r}
+set.seed(123) # setting seed for reproducibility of the results
+doParallel::registerDoParallel(cores = detectCores()) # setting parallel backend 
+cv_fit = cv.glmnet(xbgsum,y,
+                   family="binomial",
+                   parallel = T, # using parallel backend
+                   type.measure = "auc") # optimization AUC
+```
+
+Let's visualize the optimization process and derive the value of $\lambda$ that brings to the maximum AUC
+
+```{r}
+plot(cv_fit)
+```
+In this case, we select very few predictors in our best model 
+
+**Lasso profiles and Model exploration** We now explore the Lasso profiles to see how the coefficient are shrunk towards 0 as we increase the value of our regularization parameter.
+We also care about the amount of null deviance explained by each predictor.
+
+```{r}
+# last fit on the entire data
+last_fit = glmnet(xbgsum,y,
+                  family = "binomial")
+
+# extracting best lambda in term of error
+best_lambda = cv_fit$lambda.min
+
+# LASSO PROFILES
+plot(last_fit, xvar="lambda")
+title("Lasso Profiles", line = 2.5)
+abline(v = log(best_lambda), lwd = 2, lty = 2)
+
+# FRACTION DEVIANCE EXPLAINED
+plot(last_fit, xvar="dev")
+title(main = "Fraction of Deviance Explained", line = 2.5)
+
+# model exploration
+#print(last_fit)
+cat("\nBest lambda: ", best_lambda)
+```
+When optimizing the *AUC* value the best value of lambda is the one associated with a $20.42\%$ of deviance explained and 10 selected predictors, while the largest set is exactly the same we found before (numerically speaking)
+
+Now we select the variables selected in the model with the highest AUC.
+```{r}
+# extracting the significant predictors from the lasso fit, for the best lambda
+coefbgsum = coef(cv_fit,
+                s = best_lambda) %>%  as.matrix()
+```
+
+Which is the variable that has the most predictive power for our outcome?
+
+```{r}
+# max coefficient
+# extract the index corresponding to the highest abs value of the coefficients
+max_coeff_index = which.max(abs(coefbgsum[-1])) + 1 
+
+# selecting the correspondent predictor name
+max_coeff_pred = rownames(coefbgsum)[max_coeff_index]
+
+cat("The predictor that shows the greatest coefficient:", max_coeff_pred,
+    "\nwith a value of:",coefbgsum[max_coeff_index])
+```
+Again, the same question of above.
+
+Let's select that variable with not null coefficients
+```{r}
+# not null predictors
+nnz_index = which(coefbgsum != 0)[-1]
+nnz_preds = rownames(coefbgsum)[nnz_index]
+
+imp_vars_bgsum_auc = unname(nnz_preds) %>% 
+  unique()
+
+cat("Best lambda:",best_lambda, "N. of variables selected: ",length(imp_vars_bgsum_auc))
+```
+
+What is the numerical "effect" of such variables?
+```{r}
+# extracting the not null coefficients
+nnz_coeff = coefbgsum[nnz_index]
+
+# Not null predictors and coefficients
+nnz_eff_bgsum_auc = data.frame(
+  Var = nnz_preds,
+  Coeff = round(nnz_coeff,4)) %>% arrange(Coeff)
+
+#print(nnz_eff_bgsum_auc)
+```
+
+Let's check what these variables are
+```{r}
+imp_vars_bgsum_auc
+```
+
+# Wave 2020 + summary informations
+
+Let's examine all the variable from the last wave (2020), which constitute the most recent information about the individuals *considering the summary information*.
+Our prediction is that we see an increase of variable necessary to explain the same proportion of variance since the information brought from the background variable was a lot.
+
+### Classification error (+ summary info.)
+
+```{r}
+set.seed(123)
+doParallel::registerDoParallel(cores = 8)
+cv_fit = cv.glmnet(x20sum,y,
+                   family="binomial",
+                   parallel = T,
+                   type.measure = "class")
+```
+
+Let's evaluate how many predictors the models with the best $\lambda$ picked
+
+```{r}
+plot(cv_fit)
+```
+In this case (in opposition with our thinking) the number of variable needed to achieve the minimum classification error is higher than the one needed in the "only wave 20" set, while the error is approximately the same.**why?**\
+
+
+Exploring the model:
+```{r}
+# last fit on the entire data
+last_fit = glmnet(x20sum,y,
+                  family = "binomial")
+
+# extracting best lambda in term of error
+best_lambda = cv_fit$lambda.min
+
+# LASSO PROFILES
+plot(last_fit, xvar="lambda")
+title("Lasso Profiles", line = 2.5)
+abline(v = log(best_lambda), lwd = 2, lty = 2)
+
+# FRACTION DEVIANCE EXPLAINED
+plot(last_fit, xvar="dev")
+title(main = "Fraction of Deviance Explained", line = 2.5)
+
+# model exploration
+##print(last_fit)
+cat("\nBest lambda: ", best_lambda)
+```
+In this case we need 365 variables in order to achieve the $96.24\%$ of the deviance expalined. In this case we need more variable and we achieve less variance explained.
+On the other side, the bast lambda is 0.028 and this correspond to 55 variables which, alone, explain the $45.83\%$ of the total deviance (so more than the wave20 alone set).
+
+```{r}
+# extracting the significant predictors from the lasso fit, for the best lambda
+coef20sum = coef(cv_fit,
+                s = best_lambda) %>%  as.matrix()
+```
+
+Which is the variable that has the most predictive power for our outcome?
+
+```{r}
+# max coefficient
+# extract the index corresponding to the highest abs value of the coefficients
+max_coeff_index = which.max(abs(coef20sum[-1])) + 1 
+
+# selecting the correspondent predictor name
+max_coeff_pred = rownames(coef20sum)[max_coeff_index]
+
+cat("The predictor that shows the greatest coefficient:", max_coeff_pred,
+    "\nwith a value of:",coef20sum[max_coeff_index])
+```
+Again, we have that the fertility intention answer is the most important.
+
+Let's select that variable with not null coefficients
+
+```{r}
+# not null predictors
+nnz_index = which(coef20sum != 0)[-1]
+nnz_preds = rownames(coef20sum)[nnz_index]
+
+imp_vars_20sum_class = unname(nnz_preds) %>% 
+  unique()
+
+cat("Best lambda:",best_lambda, "N. of variables selected: ",length(imp_vars_20sum_class))
+```
+
+What is the numerical "effect" of such variables?
+
+```{r}
+# extracting the not null coefficients
+nnz_coeff = coef20sum[nnz_index]
+
+# Not null predictors and coefficients
+nnz_eff_20sum_class = data.frame(
+  Var = nnz_preds,
+  Coeff = round(nnz_coeff,4)) %>% arrange(Coeff)
+
+#print(nnz_eff_20sum_class)
+```
+
+Let's check what these variables are
+
+```{r}
+imp_vars_20sum_class
+```
+
+### AUC (+ summary info.)
+
+Now let's use cross validation to select the best value of the shrinkage (regularization) parameter $\lambda$, that the produce the minimum error (measured in **AUC**)
+
+```{r}
+set.seed(123)
+doParallel::registerDoParallel(cores = 8)
+cv_fit = cv.glmnet(x20sum,y,
+                   family="binomial",
+                   parallel = T,
+                   type.measure = "auc")
+```
+
+Let's evaluate how many predictors the models with the best $\lambda$ picked
+
+```{r}
+plot(cv_fit)
+```
+AUC picks for us less variables than the classification error.
+
+Exploring the model:
+```{r}
+last_fit = glmnet(x20sum,y,
+                  family = "binomial")
+
+# extracting best lambda in term of error
+best_lambda = cv_fit$lambda.min
+# LASSO PROFILES
+plot(last_fit, xvar="lambda")
+title("Lasso Profiles")
+abline(v = log(best_lambda), lwd = 2, lty = 2)
+# FRACTION DEVIANCE EXPLAINED
+plot(last_fit, xvar="dev")
+title("Fraction of Deviance Explained")
+# model exploration
+cat("Best lambda: ", best_lambda)
+#print(last_fit)
+```
+we select 35 vars. that expalin 42.37% of deviance.
+Now we select the variables selected in the model with the highest AUC.
+
+```{r}
+# extracting the significant predictors from the lasso fit, for the best lambda
+coef20sum = coef(cv_fit,
+                s = best_lambda) %>%  as.matrix()
+```
+
+Which is the variable that has the most predictive power for our outcome?
+
+```{r}
+# max coefficient
+# extract the index corresponding to the highest abs value of the coefficients
+max_coeff_index = which.max(abs(coef20sum[-1])) + 1 
+
+# selecting the correspondent predictor name
+max_coeff_pred = rownames(coef20sum)[max_coeff_index]
+
+cat("The predictor that shows the greatest coefficient:", max_coeff_pred,
+    "\nwith a value of:",coef20sum[max_coeff_index])
+```
+Again, we have that the fertility intention answer is the most effective in predicting the outcome.
+
+Let's select that variable with not null coefficients
+
+```{r}
+# not null predictors
+nnz_index = which(coef20sum != 0)[-1]
+nnz_preds = rownames(coef20sum)[nnz_index]
+
+imp_vars_20sum_auc = unname(nnz_preds) %>% 
+  unique()
+
+cat("Best lambda:",best_lambda, "N. of variables selected: ",length(imp_vars_20sum_auc))
+```
+
+What is the numerical "effect" of such variables?
+
+```{r}
+# extracting the not null coefficients
+nnz_coeff = coef20sum[nnz_index]
+
+# Not null predictors and coefficients
+nnz_eff_20sum_auc = data.frame(
+  Var = nnz_preds,
+  Coeff = round(nnz_coeff,4)) %>% arrange(Coeff)
+
+#print(nnz_eff_20sum_auc)
+```
+
+Let's check what these variables are
+
+```{r}
+imp_vars_20sum_auc
+```
+
+# Wave 20 + background info
+
+### Classification error
+
+Now let's use cross-validation to select the best value of the shrinkage (regularization) parameter $\lambda$, that the produce the minimum error (measured in **classification error**).
+
+```{r}
+set.seed(123) # setting seed for reproducibility of the results
+doParallel::registerDoParallel(cores = detectCores()) # setting parallel backend 
+cv_fit = cv.glmnet(x20bg,y,
+                   family="binomial",
+                   parallel = T, # using parallel backend
+                   type.measure = "class") # optimization fo the classification error
+```
+
+Let's visualize the optimization process and derive the value of $\lambda$ that brings to the minimum error
+
+```{r}
+plot(cv_fit) # error vs log(lambda) vs N. predictors
+```
+in this case we select more varaibles than ever before (~61).
+
+**Lasso profiles and Model exploration** We now explore the Lasso profiles to see how the coefficient are shrunk towards 0 as we increase the value of our regularization parameter.
+We also care about the amount of null deviance explained by each predictor, and we might keep into consideration also the largest informative set found.
+
+```{r}
+# last fit on the entire data
+last_fit = glmnet(x20bg,y,
+                  family = "binomial")
+
+# extracting best lambda in term of error
+best_lambda = cv_fit$lambda.min
+
+# LASSO PROFILES
+plot(last_fit, xvar="lambda")
+title("Lasso Profiles", line = 2.5)
+abline(v = log(best_lambda), lwd = 2, lty = 2)
+
+# FRACTION DEVIANCE EXPLAINED
+plot(last_fit, xvar="dev")
+title(main = "Fraction of Deviance Explained", line = 2.5)
+
+# model exploration
+#print(last_fit)
+cat("\nBest lambda: ", best_lambda)
+```
+
+When optimizing the *AUC* value the best value of lambda is the one associated with a $48.26\%$ of deviance explained.
+In this case, we select 61 variables as the best set of predictors.
+
+Now we select the variables selected in the model with the highest AUC.
+
+```{r}
+# extracting the significant predictors from the lasso fit, for the best lambda
+coef20bg = coef(cv_fit,
+                s = best_lambda) %>%  as.matrix()
+```
+
+Which is the variable that has the most predictive power for our outcome?
+
+```{r}
+# max coefficient
+# extract the index corresponding to the highest abs value of the coefficients
+max_coeff_index = which.max(abs(coef20bg[-1])) + 1 
+
+# selecting the correspondent predictor name
+max_coeff_pred = rownames(coef20bg)[max_coeff_index]
+
+cat("The predictor that shows the greatest coefficient:", max_coeff_pred,
+    "\nwith a value of:",coef20bg[max_coeff_index])
+```
+Again, we have that the fertility intention answer is the most effective in predicting the outcome.
+
+Let's select that variable with not null coefficients
+
+```{r}
+# not null predictors
+nnz_index = which(coef20bg != 0)[-1]
+nnz_preds = rownames(coef20bg)[nnz_index]
+
+imp_vars_20bg_class = unname(nnz_preds) %>% 
+  unique()
+
+cat("Best lambda:",best_lambda, "N. of variables selected: ",length(imp_vars_20bg_class))
+```
+
+What is the numerical "effect" of such variables?
+
+```{r}
+# extracting the not null coefficients
+nnz_coeff = coef20bg[nnz_index]
+
+# Not null predictors and coefficients
+nnz_eff_20bg_class = data.frame(
+  Var = nnz_preds,
+  Coeff = round(nnz_coeff,4)) %>% arrange(Coeff)
+
+#print(nnz_eff_20bg_class)
+```
+
+Let's check what these variables are
+
+```{r}
+imp_vars_20bg_class
+```
+
+### AUC
+
+We now repeat the same procedure but this time we optimize the *AUC* metric.
+
+```{r}
+set.seed(123) # setting seed for reproducibility of the results
+doParallel::registerDoParallel(cores = detectCores()) # setting parallel backend 
+cv_fit = cv.glmnet(x20bg,y,
+                   family="binomial",
+                   parallel = T, # using parallel backend
+                   type.measure = "auc") # optimization AUC
+```
+
+Let's visualize the optimization process and derive the value of $\lambda$ that brings to the maximum AUC
+
+```{r}
+plot(cv_fit)
+```
+
+**Lasso profiles and Model exploration** We now explore the Lasso profiles to see how the coefficient are shrunk towards 0 as we increase the value of our regularization parameter.
+We also care about the amount of null deviance explained by each predictor.
+
+```{r}
+# last fit on the entire data
+last_fit = glmnet(x20bg,y,
+                  family = "binomial")
+
+# extracting best lambda in term of error
+best_lambda = cv_fit$lambda.min
+
+# LASSO PROFILES
+plot(last_fit, xvar="lambda")
+title("Lasso Profiles", line = 2.5)
+abline(v = log(best_lambda), lwd = 2, lty = 2)
+
+# FRACTION DEVIANCE EXPLAINED
+plot(last_fit, xvar="dev")
+title(main = "Fraction of Deviance Explained", line = 2.5)
+
+# model exploration
+#print(last_fit)
+cat("\nBest lambda: ", best_lambda)
+```
+
+When optimizing the *AUC* value the best value of lambda is the one associated with a $42.46\%$ of deviance explained.
+In this case, we select 28 variables as the best set of predictors (double the number of variables of the classification error optimized model).
+
+Now we select the variables selected in the model with the highest AUC.
+
+```{r}
+# extracting the significant predictors from the lasso fit, for the best lambda
+coef20bg = coef(cv_fit,
+                s = best_lambda) %>%  as.matrix()
+```
+
+Which is the variable that has the most predictive power for our outcome?
+
+```{r}
+# max coefficient
+# extract the index corresponding to the highest abs value of the coefficients
+max_coeff_index = which.max(abs(coef20bg[-1])) + 1 
+
+# selecting the correspondent predictor name
+max_coeff_pred = rownames(coef20bg)[max_coeff_index]
+
+cat("The predictor that shows the greatest coefficient:", max_coeff_pred,
+    "\nwith a value of:",coef20bg[max_coeff_index])
+```
+Again, we have that the fertility intention answer is the most effective in predicting the outcome.
+
+Let's select that variable with not null coefficients
+
+```{r}
+# not null predictors
+nnz_index = which(coef20bg != 0)[-1]
+nnz_preds = rownames(coef20bg)[nnz_index]
+
+imp_vars_20bg_auc = unname(nnz_preds) %>% 
+  unique()
+
+cat("Best lambda:",best_lambda, "N. of variables selected: ",length(imp_vars_20bg_auc))
+```
+
+What is the numerical "effect" of such variables?
+
+```{r}
+# extracting the not null coefficients
+nnz_coeff = coef20bg[nnz_index]
+
+# Not null predictors and coefficients
+nnz_eff_20bg_auc = data.frame(
+  Var = nnz_preds,
+  Coeff = round(nnz_coeff,4)) %>% arrange(Coeff)
+
+#print(nnz_eff_20bg_auc)
+```
+
+Let's check what these variables are
+
+```{r}
+imp_vars_20bg_auc
+```
+
+# Full data
+
+### Classification error
+
+Now let's use cross-validation to select the best value of the shrinkage (regularization) parameter $\lambda$, that the produce the minimum error (measured in **classification error**).
+
+```{r}
+set.seed(123) # setting seed for reproducibility of the results
+doParallel::registerDoParallel(cores = detectCores()) # setting parallel backend 
+cv_fit = cv.glmnet(xall,y,
+                   family="binomial",
+                   parallel = T, # using parallel backend
+                   type.measure = "class") # optimization fo the classification error
+```
+
+Let's visualize the optimization process and derive the value of $\lambda$ that brings to the minimum error
+
+```{r}
+plot(cv_fit) # error vs log(lambda) vs N. predictors
+```
+
+**Lasso profiles and Model exploration** We now explore the Lasso profiles to see how the coefficient are shrunk towards 0 as we increase the value of our regularization parameter.
+We also care about the amount of null deviance explained by each predictor, and we might keep into consideration also the largest informative set found.
+
+```{r}
+# last fit on the entire data
+last_fit = glmnet(xall,y,
+                  family = "binomial")
+
+# extracting best lambda in term of error
+best_lambda = cv_fit$lambda.min
+
+# LASSO PROFILES
+plot(last_fit, xvar="lambda")
+title("Lasso Profiles", line = 2.5)
+abline(v = log(best_lambda), lwd = 2, lty = 2)
+
+# FRACTION DEVIANCE EXPLAINED
+plot(last_fit, xvar="dev")
+title(main = "Fraction of Deviance Explained", line = 2.5)
+
+# model exploration
+#print(last_fit)
+cat("\nBest lambda: ", best_lambda)
+```
+
+When optimizing the *AUC* value the best value of lambda is the one associated with a $48.26\%$ of deviance explained 
+In this case, we select 64 variables as the best set of predictors (almost the same result of the wave20 + background)
+
+Now we select the variables selected in the model with the highest AUC.
+
+```{r}
+# extracting the significant predictors from the lasso fit, for the best lambda
+coefall = coef(cv_fit,
+                s = best_lambda) %>%  as.matrix()
+```
+
+Which is the variable that has the most predictive power for our outcome?
+
+```{r}
+# max coefficient
+# extract the index corresponding to the highest abs value of the coefficients
+max_coeff_index = which.max(abs(coefall[-1])) + 1 
+
+# selecting the correspondent predictor name
+max_coeff_pred = rownames(coefall)[max_coeff_index]
+
+cat("The predictor that shows the greatest coefficient:", max_coeff_pred,
+    "\nwith a value of:",coefall[max_coeff_index])
+```
+here the most "effective" predictor is the kind of parent of the first child: foster parent.
+
+Let's select that variable with not null coefficients
+
+```{r}
+# not null predictors
+nnz_index = which(coefall != 0)[-1]
+nnz_preds = rownames(coefall)[nnz_index]
+
+imp_vars_all_class = unname(nnz_preds) %>% 
+  unique()
+
+cat("Best lambda:",best_lambda, "N. of variables selected: ",length(imp_vars_all_class))
+```
+
+What is the numerical "effect" of such variables?
+
+```{r}
+# extracting the not null coefficients
+nnz_coeff = coefall[nnz_index]
+
+# Not null predictors and coefficients
+nnz_eff_all_class = data.frame(
+  Var = nnz_preds,
+  Coeff = round(nnz_coeff,4)) %>% arrange(Coeff)
+
+#print(nnz_eff_all_class)
+```
+
+Let's check what these variables are
+
+```{r}
+imp_vars_all_class
+```
+
+### AUC
+
+We now repeat the same procedure but this time we optimize the *AUC* metric.
+
+```{r}
+set.seed(123) # setting seed for reproducibility of the results
+doParallel::registerDoParallel(cores = detectCores()) # setting parallel backend 
+cv_fit = cv.glmnet(xall,y,
+                   family="binomial",
+                   parallel = T, # using parallel backend
+                   type.measure = "auc") # optimization AUC
+```
+
+Let's visualize the optimization process and derive the value of $\lambda$ that brings to the maximum AUC
+
+```{r}
+plot(cv_fit)
+```
+
+**Lasso profiles and Model exploration** We now explore the Lasso profiles to see how the coefficient are shrunk towards 0 as we increase the value of our regularization parameter.
+We also care about the amount of null deviance explained by each predictor.
+
+```{r}
+# last fit on the entire data
+last_fit = glmnet(xall,y,
+                  family = "binomial")
+
+# extracting best lambda in term of error
+best_lambda = cv_fit$lambda.min
+
+# LASSO PROFILES
+plot(last_fit, xvar="lambda")
+title("Lasso Profiles", line = 2.5)
+abline(v = log(best_lambda), lwd = 2, lty = 2)
+
+# FRACTION DEVIANCE EXPLAINED
+plot(last_fit, xvar="dev")
+title(main = "Fraction of Deviance Explained", line = 2.5)
+
+# model exploration
+#print(last_fit)
+cat("\nBest lambda: ", best_lambda)
+```
+
+30 vars. 42.46% of devaince expalined
+Now we select the variables selected in the model with the highest AUC.
+
+```{r}
+# extracting the significant predictors from the lasso fit, for the best lambda
+coefall = coef(cv_fit,
+                s = best_lambda) %>%  as.matrix()
+```
+
+Which is the variable that has the most predictive power for our outcome?
+
+```{r}
+# max coefficient
+# extract the index corresponding to the highest abs value of the coefficients
+max_coeff_index = which.max(abs(coefall[-1])) + 1 
+
+# selecting the correspondent predictor name
+max_coeff_pred = rownames(coefall)[max_coeff_index]
+
+cat("The predictor that shows the greatest coefficient:", max_coeff_pred,
+    "\nwith a value of:",coefall[max_coeff_index])
+```
+Again, we have that the fertility intention answer is the most effective in predicting the outcome.
+
+Let's select that variable with not null coefficients
+
+```{r}
+# not null predictors
+nnz_index = which(coefall != 0)[-1]
+nnz_preds = rownames(coefall)[nnz_index]
+
+imp_vars_all_auc = unname(nnz_preds) %>% 
+  unique()
+
+cat("Best lambda:",best_lambda, "N. of variables selected: ",length(imp_vars_all_auc))
+```
+
+What is the numerical "effect" of such variables?
+
+```{r}
+# extracting the not null coefficients
+nnz_coeff = coefall[nnz_index]
+
+# Not null predictors and coefficients
+nnz_eff_all_auc = data.frame(
+  Var = nnz_preds,
+  Coeff = round(nnz_coeff,4)) %>% arrange(Coeff)
+
+#print(nnz_eff_all_auc)
+```
+
+Let's check what these variables are
+
+```{r}
+imp_vars_all_auc
+```
+
+# Results & Comments
+
+After different iteration of our data-driven variable selection is time to wrap up the result and give some final consideration on what we have seen do far.
+
+## Limitation of the approach
+
+Before dive deeper into the results and extract the final set of variable is important to underline some of the drawbacks of such approach:
+
+1.  Assumption: the `glmnet` algorithm is a parametric model and, therefore, we are limiting our self to consider only linear combination of the predictor without having the possibility of explore any non-linear function, or relationship, between outcome and predictors.
+2.  Usage of dummy variables: in order to fit the `glmnet` we need to convert our categorical variable into dummies (or one-hot encoded vars.), this make us unable to exploit the ordinal nature of many of our variables and can, therefore, hide some information.
+3.  Missing value: given the nature of our data we experienced a lot of missing values. Some variable, that might be an important predictor of the outcome, comes with more than 75% of NAs and we are not considering such variables in the variable selection process.
+4.  Imputation: another drawback is that `glmnet` needs the predictors to be cleaned from all the missing value. So, even for those variables that have less than 75% of missing value, we are still imputing the data. The imputation technique adopted in this analysis is trivial, we are filling the NAs with the mean value of the variable (for the numeric variables) and creating a new level for the NAs (for categorical vars.). Now, consider the variables that have more than 50% of missing values, we are actually making up a lot of information!! Therefore, some variable might be non-informative because of the high number of NAs and a more careful imputation or a different approach might reveal different results.
+5.  In this method we are not considering interaction or polynomials terms.
+
+## Comparisons of the Results
+
+"First of all, compared with the `Varaible_Selection.Rmd` file the new `make_X` function worked much better than the previous one. In this case we create an entire new level for missing value, instead of filling it with the proportion of 1s.
+We achieve greater information $\approx 96\%$ with 373 variable in the first trial (classification error and background) compared to the default `makeX` from `glmnet` package, which instead of creating the NA level and sparsify with 0 the NAs was fulfilling them with the proportion of 1.
+This might also mean that some missing value are **missing not at random** but they contain some information about previous/other questions."
+
+Starting from the differences between **variance explained** by the different sets of variables, we see that, independently by the metric used to select the best lambda we see how at the minimum level of shrinkage $\lambda = 0.001571$ the set without any kind of background information can explain, with 357 variables, the $\approx94\%$ of the deviance. On the other side the mixture of background and summary information explain alone the $\approx36.21\%$ of the deviance, or 1/3 of all the iformation availbale in the wave20.
+
+When mixing wave2020 and summary information we are able to explain $\approx96\%$ of the deviance with 365 and the same goes for the wave20 + background dataset which explain the exact same percentage of deviance using 4 variables less (361). With our surprise the complete set does not prove any advantage, at the level of the minimum lambda, since he use 372 vars to explain again the same percentage of deviance.
+
+
+When comparing the results at the best value of lambda selected we have that the best of all our set is explaining $\approx45\%$ of the total deviance with 58 to 64 vars. depending on the metric used and the set of information.
+
+
+```{r}
+# list containing the results of each variable selection process
+list_nnz = list(
+  w20_auc = nnz_eff_20_auc, 
+  w20_class = nnz_eff_20_class,
+  w20bg_auc = nnz_eff_20bg_auc,
+  w20bg_class = nnz_eff_20bg_class,
+  w20sum_auc = nnz_eff_20sum_auc,
+  w20sum_class = nnz_eff_20sum_class,
+  all_auc = nnz_eff_all_auc, 
+  all_class = nnz_eff_all_class,
+  bgsum_auc = nnz_eff_bgsum_auc, 
+  bgsum_class = nnz_eff_bgsum_class
+  )
+
+# creating the df 
+results = list(
+  var_names = c(),
+  coeff = c(),
+  model = c()
+)
+
+# fillling the df
+for (i in 1:length(list_nnz)){
+  results$var_names = c(results$var_names, list_nnz[[i]]$Var)
+  results$coeff = c(results$coeff, list_nnz[[i]]$Coeff)
+  results$model = c(results$model,rep(names(list_nnz)[i],length(list_nnz[[i]]$Var)))
+}
+
+# coercing to data.frame
+results = results %>% as.data.frame()
+
+# free memory 
+rm(list_nnz)
+```
+
+Here we have to assume that the direction of the effect for a predictor is the same in every model.
+```{r}
+# summarize the information for each question code
+results = results %>%
+  group_by(var_names) %>% # select all the var_names once
+  summarize( 
+    max_coeff = ifelse(any(coeff > 0), # extract the highest/ lowest (if negative) coefficient for that variable
+                       max(coeff[coeff > 0], na.rm = TRUE),
+                       min(coeff[coeff <= 0], na.rm = TRUE)),
+    model = model[which.max(coeff)] # keep track of when we found such coefficient
+  )
+
+# ordering by name
+results = results %>% 
+  arrange(var_names)
+
+# Process the var_names column conditionally
+final_df = results %>%
+  mutate(
+    # Extract part before the last underscore, considering the exceptions for "2020" and "f"
+    var_base = if_else(grepl("(_2020|_f)$", var_names), var_names, sub("_[^_]+$", "", var_names)),
+    # Extract part after the last underscore, considering the exceptions for "2020" and "f"
+    level = if_else(grepl("(_2020|_f)$", var_names), "None", sub("^.*_", "", var_names))
+  ) %>%
+  # Keep only the relevant part in var_names where applicable
+  mutate(var_names = var_base) %>%
+  # Select and rename columns
+  select(var_names,max_coeff,model, level)
+
+# free memory 
+# rm(results)
+```
+
+
+Let's cross check our results with the codebook to ease of the study
+```{r}
+
+# merging the result with the codebook
+imp_book = codebook %>% 
+  select(var_name, var_label, values_cat, unique_values_n, type_var, survey)
+
+final_df = 
+  merge(final_df,
+        imp_book,
+        by.x = "var_names",
+        by.y = "var_name")
+
+rm(imp_book)
+dir = "~/Desktop/Code/LOCAL-PreFer Data challenge/Data/"
+path = paste0(dir,"important_variables.csv")
+final_df %>% write.csv(path, row.names = F)
+```
+
+ALL variables selected
+```{r}
+cat("N. of selected variable across all models:", length(final_df$var_name),
+    "\nList:\n")
+
+final_df$var_name
+```
+
+# Variable exploration
+
+Since we didn't study correlation so far let's try to plot a correlation matrix using the complete set of variable that were find in the best set of predictors at least in one attempt. 
+In particular, we would like to discover redundant information or higly correlate vars. that might have escaped our variable selection method. Furthermore this might be usefult to understand which variables can be used to impute the missing values.
+```{r}
+library(corrplot)
+X = setDT(data.frame(xall))
+X = X[, .SD, .SDcols = results$var_names]
+
+corrplot(cor(X),
+         method = "color", 
+         tl.cex = 0.7,   # Reduce label size
+         tl.pos = "lt",  # Position labels to the left and top
+         tl.col = "black")  # Change label color to black)
+```
+Unfortunately the interpretation of this correlation matrix is not the easiest thing...
+
+Now, let's see what the questions selected actually mean:
+
+- `aantalki`: Number of living-at-home children in the household, children of the household head or his/her partner
+  - categorical
+  - background_train
+  - unique: 9
+  - level: 1 -> "One child"
+  - effect on log-odds(1): 0.2449
+- `belbezig`: primary occupation
+  - categorical 
+  - background_train
+  - unique: 14
+  - level: 7 -> "Attends school or is studying"
+  - effect on log-odds(1): -0.1462
+- `belbezig_2020` : primary occupation
+  - categorical 
+  - background_train
+  - unique: 14
+  - level: 7 -> "Attends school or is studying"
+  - effect on log-odds(1): -0.59 (why lower?)
+- `brutocat` : Personal gross monthly income in categories
+  - categorical 
+  - background_train
+  - unique: 13
+  - level: 10 -> "EUR 4501 to EUR 5000"
+  - effect on log-odds(1): ~ 0 (+)
+- `brutohh_f`: Gross household income in Euros
+  - numeric 
+  - background_train
+  - effect on log-odds(1): ~ 0 (+)
+- `brutohh_f_2020`: same but only 2020
+  - background summary
+- `brutoink_f`: Personal gross monthly income in Euros, imputed
+  - numeric
+  - background_train
+  - effect on log-odds(1): 0.0001
+- `brutoink_f_2020`: same but only 2020
+  - background summary
+- `burgstat`: civil status
+  - categorical
+  - background_train
+  - unique: 5
+  - levels: 1,5 -> "Married", "Never been married"
+  - effect on log-odds(1): 0.68, -0.32
+- `burgstat_2020`: civil status 2020
+  - categorical
+  - summary background
+  - unique: 5
+  - levels: 1,5 -> "Married", "Never been married"
+  - effect on log-odds(1): 0.73, ~ 0 
+- `ca20g001`: The head of household lives together with a partner (married or unmarried)
+  - binary
+  - training
+  - level: NA
+  - effect on log-odds(1): 0.1002
+- `ca20g002`: Do you take care of financial matters in the household?
+  - binary
+  - training
+  - level: NA
+  - effect on log-odds(1): 0.2037
+- `ca20g003`: Position in the household
+  - categorical
+  - training
+  - unique: 7
+  - level: NA
+  - effect on log-odds(1): 0.2006
+- `ca20g008`: On 31 December 2019, did you possess one or more of the following assets? - Cars, motorcycles, boats, (static) caravans
+  - binary
+  - training
+  - level: 0 -> "no"
+  - effect on log-odds(1): -0.2186
+- `cd20m030`: Do you pay service costs or an amount to an association of owners?
+  - categorical
+  - training
+  - level: 2 -> "no"
+  - effect on log-odds(1): 0.0535
+- `cd20m034`: How many rooms does your dwelling contain?
+  - numeric
+  - training
+  - effect on log-odds(1): 0.0201
+- `cd20m038`: What type of dwelling do you inhabit?
+  - categorical
+  - unique: 
+  - training
+  - levels: 4,5 -> "single family home, row house", "flat, apartment, floor, maisonette"
+  - effect on log-odds(1): 0.3247, -0.0273
+- `cf20m003`: Preload variable: Gender respondent
+  - binary
+  - training
+  - level: NA
+  - effect on log-odds(1): 0.2354
+- `cf20m024`: Do you currently have a partner?
+  - binary 
+  - training
+  - level: 2 -> "no"
+  - effect on log-odds(1): -0.3411
+- `cf20m025`: Do you live together with this partner?
+  - binary
+  - training
+  - level: 1 -> "yes"
+  - effect on log-odds(1): 0.1292
+- `cf20m029`: In what year did you start living together with your partner?
+  - numeric
+  - training
+  - effect on log-odds(1): 0.0284
+- `cf20m031`: In what year did you marry?
+  - numeric
+  - training
+  - effect on log-odds(1): 0.1160
+- `cf20m098`: Kind of parent: first child
+  - categorical
+  - training
+  - level: 4 -> " foster parent"
+  - effect on log-odds(1): 1.3440
+- `cf20m099`: Kind of parent: second child
+  - categorical
+  - training
+  - level: 4 -> " foster parent"
+  - effect on log-odds(1): 0.0081
+- `cf20m128`: Do you think you will have [more] children in the future?
+  - categorical
+  - training
+  - unique: 3
+  - level: 1,2 -> "yes", "no"
+  - effects on log-odds(1): 1.3374, -1.0500
+- `cf20m129`: How many [more] children do you think you will have in the future?
+  - numeric
+  - training
+  - effect on log-odds(1): -0.2363
+- `cf20m180`: How satisfied are you with your current relationship?
+  - categorical
+  - unique: 11
+  - training
+  - level: 8 -> "8"
+  - effect on log-odds(1): 0.0698
+- `cf20m486`: How is the household work divided between you and your partner? - odd jobs in and around the house
+  - categorical
+  - unique 5
+  - training
+  - level: 5 -> "my partner does a lot more than"
+  - effect on log-odds(1): 0.0937
+- `ch20m219`:	gynaecologist
+  - binary
+  - training
+  - level: 0,1
+  - effects on log-odds(1): -0.2573, 0.5980
+- `ci20m092`: Did you receive one or more of the following benefits or allowances in 2019? - orphan's pension (from a pension fund or insurer)
+  - binary
+  - training
+  - level: 0 -> "no"
+  - effect on log-odds(1): -0.6366
+- `ci20m203`: Did you pay more than 100 euros in 2019 in interest on personal loans, continuous credit or other loans?
+  - binary
+  - training
+  - level: 2 -> "yes"
+  - effect on log-odds(1): -0.1484
+- `ci20m211`: Did you provide children living on their own (also children not studying) with any other form of financial support or financial gifts in 2019?
+  - categorical
+  - unique: 3
+  - training
+  - level: 3 -> "not applicable"
+  - effect on log-odds(1): 0.1498
+- `ci20m265`: How would you describe the way in which financial affairs are managed?
+  - categorical
+  - unique: 5
+  - training
+  - level: 5 -> "other"
+  - effect on log-odds(1): 0.1845
+- `ci20m354`: Do you pay for one or more memberships of a sports club and suchlike?
+  - categorical
+  - unique: 5
+  - training 
+  - level: 5 -> "not applicable"
+  - effect on log-odds(1): 0.0636
+
+
+
+# Non parametric Varaible importance
+
+## Adjusting the data for Random Forest algorithm
+Given that the random forest algorithm can handle factors in a way that is computationally faster that working with one-hot encoded variables and that many of our variables, indeed, reference to ordered factors we will exploit this and provide the random forest with the entire factors. This can also help us to consider the relationship between different levels of a single factor or multiple factors.
+
+For the numerical variables we still impute the mean value to fill the missing.
+```{r}
+# variable selected list
+var_selection = c(unique(final_df$var_names), "nomem_encr")
+
+# creating a df with only the vars selected
+prefer_selected = prefer_full[, .SD, .SDcols = var_selection]
+
+# coercing categorical data into factors
+for(i in names(prefer_selected)){
+  if(i %in% codebook$var_name &
+     codebook[var_name == i,type_var] == "categorical"){
+    prefer_selected[[i]] = as.factor(prefer_selected[[i]])
+  }
+}
+
+# imputing missing value for numerical vars. with the mean
+prefer_importance = impute_with_mean(prefer_selected)
+
+# imputing missing placeholder for categorical vars.
+prefer_importance <- prefer_importance %>%
+  mutate(across(where(is.factor), ~ fct_na_value_to_level(.x, level = "missing")))
+
+# Merging the training set with the outcome
+prefer_importance = merge(prefer_importance,
+                          outcome,
+                          by = "nomem_encr")
+
+# coercing outcome to factor
+prefer_importance$new_child = as.factor(prefer_importance$new_child)
+```
+
+## Modeling with Random Forest
+Given that at this stage we are not interest in the final performance of the model we simply perform cross-validation to pick the best set of parameters (optimizing the f1 score) and then compute the measure of variable importance.
+```{r}
+library(tidymodels)
+
+set.seed(123)
+folds = vfold_cv(prefer_importance, # repeated k-fold cv
+                 #repeats = 3,
+                 # stratifying for outcome
+                 strata = new_child)
+# checking folds
+#folds
+
+rf_recipe =
+  recipe(formula = new_child ~ .,
+         data = prefer_importance %>%
+           select(-nomem_encr)) 
+
+rf_spec =
+  rand_forest(mtry = tune(),
+              # number of canditate for each split
+              min_n = tune(),
+              # number of obs. for final node (smoothness)
+              trees = tune()) %>% # number of parallel sample (1 tree: 1 sample)
+  set_mode("classification") %>%
+  # using ranger for increased speed over randomForest
+  set_engine("ranger")
+
+# Setting the workflow
+rf_workflow =
+  workflow() %>%
+  add_recipe(rf_recipe) %>%
+  add_model(rf_spec)
+
+# Regular grid of parameters
+grid_reg = grid_regular(
+  # number of candidates for each split
+  finalize(mtry(),prefer_importance %>% select(-nomem_encr)),
+  # number of obs. for final node (smoothness)
+  trees(range = c(100, 5000)),
+  # number of parallel sample (1 tree: 1 sample)
+  min_n(range = c(2, 20)),
+  levels = 3)
+
+## Hyper-parameters tuning ####
+set.seed(93568)
+
+# parallelizing the process
+doParallel::registerDoParallel(cores = 8) # parallel backend
+
+# cross validation
+rf_tune =
+  rf_workflow %>%
+  tune_grid(
+    # resample to use
+    resamples = folds,
+    # comb. of params to be tested
+    grid = grid_reg,
+    # allowing for multi-core backend (default)
+    control = control_grid(allow_par = T),
+    # specifying metric
+    metrics = metric_set(f_meas)
+  )
+
+# Results of the training
+res_f1 = show_best(rf_tune,
+                   metric = "f_meas",n = 25)
+
+res_f1
+
+autoplot(rf_tune,
+         metric = "f_meas")
+
+## Finalizing the model ####
+final_rf = rf_workflow %>%
+  finalize_workflow(select_best(rf_tune,
+                                metric = "f_meas"))
+
+# FINAL (TUNED) MODEL
+final_rf 
+
+```
+
+## Variable Importance
+```{r}
+library(vip)
+
+# re-train to save importance values -> node impurity
+imp_spec <- rand_forest(
+  mtry = 42,
+  trees = 2550,
+  min_n=2
+) %>% 
+  set_mode("classification") %>% 
+  set_engine("ranger", 
+             importance = "permutation") # accounting for factors' cardianlity
+
+
+workflow() %>%
+  add_recipe(rf_recipe) %>% # formula
+  add_model(imp_spec) %>% # selecting spec of the model
+  fit(prefer_importance) %>% # actual fit
+  extract_fit_parsnip() %>% # extracting the model
+  vip(aesthetics = list(alpha = 0.8, fill = "midnightblue"),
+      include_type = T,
+      num_features = 100)
+```
+
+
+
