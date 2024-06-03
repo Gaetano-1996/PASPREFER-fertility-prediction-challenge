@@ -1,4 +1,4 @@
-# This is an example script to train your model given the (cleaned) input dataset.
+# PASPREFER - FINAL SUBMISSION #
 # 
 # This script will not be run on the holdout data, 
 # but the resulting model model.joblib will be applied to the holdout data.
@@ -24,7 +24,6 @@ train_save_model = function(cleaned_df, # clean training set
                    by = "nomem_encr") %>% 
     filter(!is.na(new_child)) %>% # filtering obs. with no outcome
     mutate(new_child = factor(new_child)) # converting response to factor
-  # for classification
   
   
   # Data Modeling
@@ -36,68 +35,112 @@ train_save_model = function(cleaned_df, # clean training set
                    repeats = 3, # repeating 10-folds cv for 3 time 
                    strata = new_child) # stratifying for classes
   
-  # Defining recipe
-  rf_recipe =
-    recipe(formula = new_child ~.,
-           data = model_df %>% 
-             # removing id code from variable
-             select(-nomem_encr, -intention))  
+  # OTHER DATA RECIPE (NO INTENTION)
+  recipe_other = 
+    recipe(formula = new_child ~ .,
+           data = model_df %>% select(-nomem_encr,
+                                      # no intentions
+                                      -intentionB,-intention2B, -intention3B,
+                                      # taking values sum and 2c
+                                      -values_1c, -values_3c, -values_4c,
+                                      # removing low importance vars
+                                      -migration, -gender_emp, -soc_lib)) 
   
-  # Model Specification
-  rf_spec = 
-    rand_forest(mtry = tune(), # N. of candiadates predictors at each split
-                min_n = tune(), # Min. N. of obs. x terminal node
-                trees = tune()) %>% # N. of trees
+  # INTENTION ONLY
+  recipe_intentions = 
+    recipe(
+      # try to include intentionB to acocunt for "not_known" level
+      formula = new_child ~  intentionB + intention2B + intention3B,
+      data = model_df) 
+  
+  # MODEL SPECIFICATION
+  rf_specs =
+    rand_forest(
+      mtry = tune(),
+      min_n = tune(),
+      trees = tune()
+    ) %>% 
     set_mode("classification") %>% 
     set_engine("ranger")
   
-  
-  # Setting workflow
-  rf_wflow =
+  # WORKFLOWS
+  wf_other = 
     workflow() %>% 
-    add_recipe(rf_recipe) %>% 
-    add_model(rf_spec)
+    add_recipe(recipe_other) %>% 
+    add_model(rf_specs)
   
-  # Hyper-params grid
-  grid_params = grid_regular(
-    finalize(mtry(), # number of candidates for each split
-             model_df %>% 
-               select(-nomem_encr, -intention)),
-    trees(range = c(100,5000)), # number of obs. for final node (smoothness)
-    min_n(range = c(2,20)), # number of parallel sample (1 tree: 1 sample)
-    levels = 5
-  )
+  wf_intentions = 
+    workflow() %>% 
+    add_recipe(recipe_intentions) %>% 
+    add_model(rf_specs)
   
-  # Tuning
-  set.seed(123)
-  doParallel::registerDoParallel( # parallel backend
-    cores = detectCores()) # setting number of cores to the max available 
+  # Creating general control grid for stack
+  ctrl_grid = control_stack_grid()
   
-  rf_tune =
-    tune_grid(
-      rf_wflow, # workflow
-      resamples = folds, # resample
-      grid = grid_params, # hyper-parameters grid
-      control = control_grid(
-        verbose = F, 
-        allow_par = T), # allowing for parallel backend
-      metrics = metric_set(
-        f_meas)
+  ## TUNING OTHER MODEL --------------------------------------------------------
+  set.seed(93568)
+  grid_other =
+    grid_latin_hypercube(
+      mtry(range = c(1,30)),
+      trees(range = c(50,2000)),
+      min_n(),
+      size = 250
     )
   
-  # Finalizing the model 
-  final_model =
-    rf_wflow %>% 
-    finalize_workflow(select_best(
-      rf_tune, metric = "f_meas"
-    )) 
+  set.seed(93568)
+  doParallel::registerDoParallel( # parallel backend
+    cores = detectCores())
+  
+  rf_other = 
+    wf_other %>% 
+    tune_grid(
+      resample = folds,
+      grid = grid_other,
+      metrics = metric_set(pr_auc),
+      control = ctrl_grid
+    )
+  
+  
+  ## TUNING INTENTIONS MODEL ---------------------------------------------------
+  set.seed(93568)
+  grid_intentions =
+    grid_latin_hypercube(
+      mtry(range = c(1,2)),
+      trees(range= c(1,1000)),
+      min_n(), # default from 2 to 40
+      size = 125
+    )
+  
+  set.seed(93568)
+  doParallel::registerDoParallel( # parallel backend
+    cores = detectCores())
+  
+  rf_intentions = 
+    wf_intentions %>% 
+    tune_grid(
+      resample = folds,
+      grid = grid_intentions,
+      metrics = metric_set(pr_auc),
+      control = ctrl_grid
+    )
+  
+  ## Stacking --------------------------------------------------------------------
+  set.seed(93568)
+  rf_stack =
+    stacks() %>% 
+    add_candidates(rf_intentions) %>% 
+    add_candidates(rf_other) %>% 
+    blend_predictions(
+      metric = metric_set(f_meas),
+      times = 100 # improve stability of the resampling process
+    ) %>% 
+    fit_members()
   
   
   # Saving the model 
   # Serialization 
   save_bundle =
-    final_model %>% 
-    fit(model_df) %>%
+    rf_stack %>%
     butcher() %>% # extracting the actual model from its parnsip format
     bundle() # serilization of the model -> convert into binary
   
