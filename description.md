@@ -238,14 +238,14 @@ of the predictors (like a random forest would do), degrading its
 performance.
 
 With both Random Forest and Gradient Boosting we noticed that the
-variable relative to the intention of fertility (item `ch20m130` between
+variable relative to the intention of fertility (item `cf20m130` between
 the others) was by far the strongest predictor.We, therefore, decided to
 model the fertility intentions variables on their own and than combine
 the predictions coming from such model with the predictions obtained
 using the rest of the features. We trained two different Random Forest
 Classifiers, one using as predictors only the variable relive to the
 fertility intentions (namely the engineered versions of the items
-`ch20m128`, `ch20m129`, `ch20m130`) and the other accounting for the
+`cf20m128`, `cf20m129`, `cf20m130`) and the other accounting for the
 rest of the features.
 
 In particular, we tuned (to maximize the *precision-recall auc* metric)
